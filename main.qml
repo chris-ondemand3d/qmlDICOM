@@ -97,6 +97,11 @@ ApplicationWindow {
         TableViewColumn{ role: "sopInstanceUID" ; title: "SopInstanceUID" ; visible: true}
         TableViewColumn{ role: "numberOfImages" ; title: "NumberOfImages" ; visible: true}
         model: studySeriesModel
+
+        onDoubleClicked: {
+            console.log(row)
+            studySeriesModel.notifySeriesInstanceUID(row)
+        }
     }
 
 

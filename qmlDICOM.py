@@ -9,16 +9,111 @@ from PySide2.QtWidgets import QFileSystemModel
 from enum import Enum
 import copy
 import gdcm
-
+import pydicom
+import numpy
+import vtk
+from matplotlib import pyplot
+from operator import itemgetter, attrgetter
 
 # Todo on Nov. 22
 # 1) Implement studySeriesModel - OK
 # 2) Open method
 # 3) Open Image Window
 # 4) Laplace Histogram
-# 5) Orca Library integration
-# 6) Rendering - multiobject rendering
-# 7) Modular structure
+# 5) OpenJpeg, jp3d 
+# 6) Orca Library integration
+# 7) Rendering - multiobject rendering
+# 8) Modular structure
+
+
+def get_gdcm_to_numpy_typemap():
+    """Returns the GDCM Pixel Format to numpy array type mapping."""
+    _gdcm_np = {gdcm.PixelFormat.UINT8: numpy.uint8,
+                gdcm.PixelFormat.INT8: numpy.int8,
+                # gdcm.PixelFormat.UINT12 :numpy.uint12,
+                # gdcm.PixelFormat.INT12  :numpy.int12,
+                gdcm.PixelFormat.UINT16: numpy.uint16,
+                gdcm.PixelFormat.INT16: numpy.int16,
+                gdcm.PixelFormat.UINT32: numpy.uint32,
+                gdcm.PixelFormat.INT32: numpy.int32,
+                # gdcm.PixelFormat.FLOAT16:numpy.float16,
+                gdcm.PixelFormat.FLOAT32: numpy.float32,
+                gdcm.PixelFormat.FLOAT64: numpy.float64}
+    return _gdcm_np
+
+
+def get_numpy_array_type(gdcm_pixel_format):
+    """Returns a numpy array typecode given a GDCM Pixel Format."""
+    return get_gdcm_to_numpy_typemap()[gdcm_pixel_format]
+
+
+def gdcm_to_numpy(image):
+    """Converts a GDCM image to a numpy array.
+    """
+    pf = image.GetPixelFormat()
+
+    assert pf.GetScalarType() in get_gdcm_to_numpy_typemap().keys(), "Unsupported array type %s" % pf
+    assert pf.GetSamplesPerPixel() == 1, "SamplesPerPixel is not 1" % pf.GetSamplesPerPixel()
+    shape = image.GetDimension(0) * image.GetDimension(1)
+    if image.GetNumberOfDimensions() == 3:
+        shape = shape * image.GetDimension(2)
+
+    dtype = get_numpy_array_type(pf.GetScalarType())
+    gdcm_array = image.GetBuffer().encode("utf-8", errors="surrogateescape")
+    volume = numpy.frombuffer(gdcm_array, dtype=dtype)
+
+    if image.GetNumberOfDimensions() == 2:
+        result = volume.reshape(image.GetDimension(0), image.GetDimension(1))
+    elif image.GetNumberOfDimensions() == 3:
+        result = volume.reshape(image.GetDimension(2), image.GetDimension(0), image.GetDimension(1))
+
+    #    result.shape = shape
+    return result
+
+def getVector(strIP):
+    str = ""
+    j1 = 0
+    j2 = 0
+    for j in range(len(strIP)):
+        if (strIP[j] == '\\' and j1 == 0):
+            j1 = j
+        elif (strIP[j] == '\\' and j1 != 0):
+            j2 = j
+    x = float(strIP[0:j1])
+    y = float(strIP[j1 + 1:j2])
+    z = float(strIP[j2 + 1:])
+    return x, y, z
+
+def getCosine(strIP):
+    i=0
+    j=[0,0,0,0,0,0]
+    print(strIP)
+    for k in range(len(strIP)):
+        if (strIP[k]=='\\' and j[i] == 0):
+            j[i]=k
+            i=i+1
+    if (i!=5):
+        print("False cosine string")
+        return( [1.0, 0.0, 0.0, 0.0, 1.0, 0.0] )
+    else:
+        print(j)    
+        c0 = float(strIP[0:j[0]])
+        c1 = float(strIP[j[0]+1:j[1]])
+        c2 = float(strIP[j[1]+1:j[2]])
+        c3 = float(strIP[j[2]+1:j[3]])
+        c4 = float(strIP[j[3]+1:j[4]])
+        c5 = float(strIP[j[4]+1:j[5]])
+        c6 = float(strIP[j[5]:])
+        return( [c0,c1,c2,c3,c4,c5,c6] )
+
+def thru_plane_position(px,py,pz,orientation):
+    #position = image.GetOrigin()
+    position = (px,py,pz)
+    rowvec, colvec = orientation[:3],orientation[3:]
+    normal_vec = numpy.cross(rowvec,colvec)
+    slice_pos = numpy.dot(position,normal_vec)
+    # print(position,rowvec,colvec,normal_vec,slice_pos)
+    return slice_pos
 
 
 class myStudyModel(QAbstractTableModel):
@@ -86,6 +181,11 @@ class myStudyModel(QAbstractTableModel):
 
 class studySeriesModel(QAbstractTableModel):
     COLUMN_NAMES = ("studyID", "studyInstanceUID", "seriesNum", "seriesInstanceUID", "sopClassUID", "sopInstanceUID", "numberOfImages")
+    # rows
+    # allrows
+    # imageFiles
+
+    selectRow = Signal(str)
 
     def __init__(self):
         QAbstractTableModel.__init__(self)
@@ -120,10 +220,11 @@ class studySeriesModel(QAbstractTableModel):
             value = self.rows[row][columnIdx]
         return value
 
-    @Slot(object)
-    def refreshSeriesList(self, seriesList):
+    @Slot(object,object)
+    def refreshSeriesList(self, seriesList, files):
         print("Refresh SeriesList:",len(self.allrows),len(seriesList))
         self.allrows = seriesList
+        self.imageFiles = files
 
     @Slot(str)
     def refreshUID(self, studyUID):
@@ -142,6 +243,131 @@ class studySeriesModel(QAbstractTableModel):
                 if (row[1] == studyUID):
                     self.rows.append(row)
             self.endInsertRows()
+
+    @Slot(int)
+    def notifySeriesInstanceUID(self,row):
+        # value = Selected SeriesInstanceUID 
+        value = self.rows[row][3]        
+        self.selectRow.emit(value)
+
+        # Load Data/Rendering Data
+        dcmfiles = []
+
+        if len(self.imageFiles[value])==1 :
+            if (self.imageFiles[value][0][0] > 1) : # Multiframe, gdcm read to numpy
+                qDebug("Multiframe Image")
+                reader = gdcm.ImageReader()
+                reader.SetFileName(self.imageFiles[value][0][1])
+                if (not reader.Read()):
+                    qDebug("Cannot read image", self.imageFiles[value][0][1])
+                else:
+                    image = reader.GetImage()
+                    npVolume = numpy.flip(gdcm_to_numpy(image),1)
+                    w, d, h = image.GetDimension(0), image.GetDimension(1), image.GetDimension(2)
+                    spacing = image.GetSpacing()
+                    dx, dy, dz = abs(spacing[0]), abs(spacing[1]), abs(spacing[2])
+                    iRescaleIntercept = image.GetIntercept()
+                    iRescaleSlope = image.GetSlope()
+
+                    # pyplot single slice
+                    x = numpy.arange(0.0, (w+1)*dx, dx)
+                    y = numpy.arange(0.0, (d+1)*dy, dy)
+                    z = numpy.arange(0.0, (h+1)*dz, dz)
+                    pyplot.figure(dpi=200)
+                    pyplot.axes().set_aspect('equal', 'datalim')
+                    pyplot.set_cmap(pyplot.gray())
+                    pyplot.pcolormesh(x, y, npVolume[25,:, :])
+                    pyplot.show()
+
+            else:
+                qDebug("Single Image Series: Do nothing")
+        else:
+            qDebug("Multiple slice dicom files")
+
+            ireader = gdcm.ImageReader()
+            firstFile = self.imageFiles[value]
+            ireader.SetFileName(firstFile[0][1])
+            # print("First file is ", firstFile[0][1])
+            if (not ireader.Read()):
+                print("Cannot read image", image_file)
+                sys.exit(1)
+
+            image = ireader.GetImage()
+            w, d = image.GetDimension(0), image.GetDimension(1)
+            cosine = image.GetDirectionCosines()
+
+            pf = image.GetPixelFormat()
+            assert pf.GetScalarType() in get_gdcm_to_numpy_typemap().keys(), "Unsupported array type %s" % pf
+            assert pf.GetSamplesPerPixel() == 1, "Support only one samples"
+
+            spacing = image.GetSpacing()
+            dx = float(spacing[0])
+            dy = float(spacing[1])
+
+            iRescaleIntercept = image.GetIntercept()
+            iRescaleSlope = image.GetSlope()
+
+            dtype = get_numpy_array_type(pf.GetScalarType())
+
+            print(w,d,dx,dy,cosine,iRescaleIntercept,iRescaleSlope,dtype)
+
+            images = []
+            for imageFile in self.imageFiles[value]:
+                reader = gdcm.Reader()
+                reader.SetFileName(imageFile[1])
+                # Get the DICOM File structure
+                if not reader.Read():
+                    print (imageFile[1], "Not a valid DICOM file")
+                    sys.exit(1)
+                file = reader.GetFile()
+                if (file):                
+                    sf = gdcm.StringFilter()
+                    sf.SetFile(file)
+                    # print(sf.ToStringPair(gdcm.Tag(0x0020,0x0032)))
+                    # Get the DataSet part of the file
+                    dataset = file.GetDataSet()
+                    strIP = str(dataset.GetDataElement( gdcm.Tag(0x20,0x32) ).GetValue())
+                    px,py,pz = getVector(strIP)
+                    # print(imageFile[1],strIP,px,py,pz,cosine)
+                    images.append([imageFile[1],thru_plane_position(px,py,pz,cosine)])
+                else:
+                    qDebug("Cannot read image position")
+            
+            dcm_slices = sorted(images,key=itemgetter(1))
+
+            spacings = numpy.diff([dcm_slice[1] for dcm_slice in dcm_slices])
+            slice_spacing = numpy.mean(spacings)
+
+            # All slices will have the same in-plane shape
+            h = len(dcm_slices)
+            dz = slice_spacing
+            print(h,dz)
+
+            npVolume = numpy.zeros((h, d, w), dtype=dtype)
+
+            for i in range(len(dcm_slices)):
+                ireader = gdcm.ImageReader()
+                ireader.SetFileName(dcm_slices[i][0])
+                # print(dcm_slices[i])
+                if (not ireader.Read()):
+                    print("Cannot read image", dcm_slices[i][0])
+                    sys.exit(1)
+                image = ireader.GetImage()
+                gdcm_array = image.GetBuffer().encode("utf-8", errors="surrogateescape")
+                result = numpy.frombuffer(gdcm_array, dtype=dtype)
+                npVolume[i, :, :] = numpy.flipud(result.reshape(d, w).copy())
+                
+            # pyplot single slice
+            x = numpy.arange(0.0, (w+1)*dx, dx)
+            y = numpy.arange(0.0, (d+1)*dy, dy)
+            z = numpy.arange(0.0, (h+1)*dz, dz)
+            pyplot.figure(dpi=200)
+            pyplot.axes().set_aspect('equal', 'datalim')
+            pyplot.set_cmap(pyplot.gray())
+            pyplot.pcolormesh(x, y, npVolume[100,:, :])
+            pyplot.show()
+
+
 
 class ProgressWatcher(gdcm.SimpleSubjectWatcher, QObject):
     notifyProgress = Signal(float)
@@ -215,7 +441,7 @@ class myDirModel(QFileSystemModel,QObject):
     dirSelected = Signal(QModelIndex)
     scanProgressed = Signal(float)
     scanDirStudy = Signal(object)
-    scanDirSeries = Signal(object)
+    scanDirSeries = Signal(object,object)
 
     def __init__(self):
         QFileSystemModel.__init__(self)
@@ -262,7 +488,7 @@ class myDirModel(QFileSystemModel,QObject):
 
         self.scanProgressed.emit(1.0)
         self.scanDirStudy.emit(res[0])
-        self.scanDirSeries.emit(res[1])
+        self.scanDirSeries.emit(res[1],res[2])
         self.Scanning = False
 
     @Slot()
@@ -288,7 +514,7 @@ class myDirModel(QFileSystemModel,QObject):
         self.w = ProgressWatcher(s, 'Watcher')
         self.w.notifyProgress.connect(self.scanProgress)
 
-        # Populate Study, Series, Image lists
+        # Populate Study, Series lists
         if (not self.Scanning):
             pass # start scanning
             self.Scanning = True
@@ -303,7 +529,9 @@ class myDirModel(QFileSystemModel,QObject):
     def scanDir(self, strPath, s):
         d = gdcm.Directory();
         nfiles = d.Load(strPath);
-        if (nfiles == 0): sys.exit(-1); # No DICOM files in the directory
+        if (nfiles == 0): 
+            qDebug("Empty directory")
+            return [] # No files in the directory
 
         filenames = d.GetFilenames()
         qDebug("The number of files to scan is "+ str(len(filenames)))
@@ -374,18 +602,20 @@ class myDirModel(QFileSystemModel,QObject):
         # if no files in this directory
         dicomfiles = []
         if (not b):
-            qDebug("Empty directory")
-            return dicomfiles
+            qDebug("No DICOM files in this directory")
+            return []
 
         study_list = []
         series_list = []
         series_count = {}
         image_count = {}
+        image_files = {}
 
         for aFile in filenames:
-            if (s.IsKey(aFile)):  # existing DICOM file
+            if (s.IsKey(aFile)):  # DICOM file
                 # qDebug("Scan "+aFile)
                 is_multiframe = 0
+                is_scout = 0  # if slice location or image position = NULL: is_scout = 1 and skipped
 
                 pttv = gdcm.PythonTagToValue(s.GetMapping(aFile))
                 pttv.Start()
@@ -395,8 +625,6 @@ class myDirModel(QFileSystemModel,QObject):
 
                 # iterate until the end:
                 while (not pttv.IsAtEnd()):
-
-
 
                     # get current value for tag and associated value:
                     # if tag was not found, then it was simply not added to the internal std::map
@@ -460,15 +688,18 @@ class myDirModel(QFileSystemModel,QObject):
                 # new SeriesInstanceUID
                 if (seriesinstance_uid not in image_count.keys()):
                     # Add to the series_list
-                    series_list.append([study_id, studyinstance_uid, seriesinstance_uid, series_num, sopclass_uid, sopinstance_uid, 0])
+                    series_list.append([study_id, studyinstance_uid, series_num, seriesinstance_uid, sopclass_uid, sopinstance_uid, 0])
                     # Add count
                     image_count[seriesinstance_uid] = 0
+                    image_files[seriesinstance_uid] = []
                     series_count[studyinstance_uid] += 1
 
                 if (is_multiframe==0):
                     image_count[seriesinstance_uid] += 1
+                    image_files[seriesinstance_uid].append([is_multiframe,aFile])
                 else:
                     image_count[seriesinstance_uid] += is_multiframe
+                    image_files[seriesinstance_uid].append([is_multiframe,aFile])   
 
         # print(series_count)
         # print(image_count)
@@ -479,12 +710,16 @@ class myDirModel(QFileSystemModel,QObject):
 
         # for each series_list items update images_count from image_count(seriesinstance_uid)
         for series in series_list:
-            series[6] = image_count[series[2]]
+            series[6] = image_count[series[3]]
 
         #print(study_list)
         #print(series_list)
 
-        return study_list, series_list
+        # for each series_instance_uid : analysis and fill attribute
+
+
+        return study_list, series_list, image_files
+
 
 
 
@@ -496,7 +731,7 @@ if __name__ == "__main__":
     #Expose the list to the Qml code
     m_Database = QSqlDatabase()
     m_Database = QSqlDatabase.addDatabase("QSQLITE");
-    m_Database.setDatabaseName("C:\dev\Work\python\SQLTest\o3.db");
+    m_Database.setDatabaseName("d:\dev\Work\python\SQLTest\o3.db");
 
     # Don't know why it is not working with (.mde file?, ...)
     #    m_Database = QSqlDatabase.addDatabase("QODBC");
@@ -510,8 +745,11 @@ if __name__ == "__main__":
     my_StudyModel = myStudyModel()
     my_SeriesModel = studySeriesModel()
     my_StudyModel.selectRow.connect(my_SeriesModel.refreshUID)
+    # my_SeriesModel.selectRow.connect()
+
+
     # Temporarily, setting default path manually
-    path = "C:\\dev\\Work\\TestData"
+    path = "D:\\dev\\Work\\TestData"
 
     dirModel = myDirModel()
     dirModel.setFilter(QDir.NoDotAndDotDot | QDir.AllDirs)
