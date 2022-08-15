@@ -1,4 +1,3 @@
-# This Python file uses the following encoding: utf-8
 import os, sys, urllib.request, json, time, traceback
 from PySide2.QtGui import QGuiApplication
 from PySide2.QtQml import QQmlApplicationEngine, qmlRegisterType
@@ -11,19 +10,17 @@ import copy
 import gdcm
 import pydicom
 import numpy
+import shutil
+
+# imports for SQL data part
+import pyodbc
+from datetime import datetime, timedelta
+import pandas as pd
+
 # import vtk
 from matplotlib import pyplot
 from operator import itemgetter, attrgetter
-
-# Todo on Nov. 22
-# 1) Implement studySeriesModel - OK
-# 2) Open method
-# 3) Open Image Window
-# 4) Laplace Histogram
-# 5) OpenJpeg, jp3d 
-# 6) Orca Library integration
-# 7) Rendering - multiobject rendering
-# 8) Modular structure
+import gdcm
 
 
 def get_gdcm_to_numpy_typemap():
@@ -403,7 +400,6 @@ class ProgressWatcher(gdcm.SimpleSubjectWatcher):
     def ShowFileName(self, sender, event):
         pass
 
-
 class WorkerSignal(QObject):
     finished = Signal()
     error = Signal(tuple)
@@ -438,7 +434,6 @@ class Worker(QRunnable):
             self.signals.finished.emit() # Done
 
 
-
 class myDirModel(QFileSystemModel,QObject):
 
     dirSelected = Signal(QModelIndex)
@@ -446,15 +441,16 @@ class myDirModel(QFileSystemModel,QObject):
     scanDirStudy = Signal(object)
     scanDirSeries = Signal(object,object)
 
-    def __init__(self):
+    def __init__(self,cnxn):
         QFileSystemModel.__init__(self)
         self.sizeRole = int(Qt.UserRole+1)
         self.dirSelected.connect(self.selDirPath)
         self.Scanning = False
         self.threadpool = QThreadPool()
         self.progress = 0.0
+        self.con = cnxn
         print("Multithreading with maximum %d threads" % self.threadpool.maxThreadCount())
-
+    
     def sizeString(self, fInfo):
         if (not fInfo.isDir()):
            return ""
@@ -463,17 +459,16 @@ class myDirModel(QFileSystemModel,QObject):
         size = 0
         for filePath in dir.entryList(fileFilters):
             fi = QFileInfo(dir,filePath)
-            print(filePath,fi.isDir())
+            #print(filePath,fi.isDir())
             
             if (fi.isDir()):
-                pass
-                print(filePath,"is directory")
+                #print(filePath,"is directory")
                 dir1 = fi.Dir()
                 for filePath1 in dir1.entryList(fileFilters):
                     fi1 = QFileInfo(dir1,filePath1)
                     if (fi1.isDir()):
-                        print(filePath,"is directory")
                         pass
+                        #print(filePath,"is directory")
                     else:
                         size += fi1.size
             else:
@@ -544,200 +539,206 @@ class myDirModel(QFileSystemModel,QObject):
 
 
     def scanDir(self, strPath, s):
-        d = gdcm.Directory();
-        nfiles = d.Load(strPath);
-        if (nfiles == 0): 
-            qDebug("Empty directory")
-            return [] # No files in the directory
 
-        filenames = d.GetFilenames()
-        qDebug("The number of files to scan is "+ str(len(filenames)))
-
+        tag = [ gdcm.Tag(0x10, 0x20),  # 0  Patient ID
+                gdcm.Tag(0x10, 0x10),  # 1  Patient Name
+                gdcm.Tag(0x08, 0x50),  # 2  Accession Number
+                gdcm.Tag(0x20, 0x10),  # 3  Study ID
+                gdcm.Tag(0x20, 0x0d),  # 4  Study Instance UID
+                gdcm.Tag(0x20, 0x0e),  # 5  Series Instance UID
+                gdcm.Tag(0x20, 0x11),  # 6  Series Number
+                gdcm.Tag(0x28, 0x08),  # 7  Number of Frames
+                gdcm.Tag(0x20, 0x32),  # 8  Image Position
+                gdcm.Tag(0x28, 0x30),  # 9  Pixel Spacing
+                gdcm.Tag(0x20, 0x37),  # 10 Image Orientation Patient
+                gdcm.Tag(0x28, 0x02),  # 11 Samples per pixel
+                gdcm.Tag(0x28, 0x04),  # 12 Photometric Interpretation
+                gdcm.Tag(0x28, 0x10),  # 13 Rows
+                gdcm.Tag(0x28, 0x11),  # 14 Column
+                gdcm.Tag(0x28, 0x101), # 15 BitStored
+                gdcm.Tag(0x02, 0x02),  # 16 Media Storage SOP Class UID
+                gdcm.Tag(0x02, 0x03),  # 17 Media Storage SOP Instance UID
+                gdcm.Tag(0x02, 0x10),  # 18 Transfer Syntax
+                gdcm.Tag(0x08, 0x16),  # 19 SOP Class UID
+                gdcm.Tag(0x08, 0x18),  # 20 SOP Instance UID
+                gdcm.Tag(0x5200, 0x9229),  # 21 Shared functional group
+                gdcm.Tag(0x5200, 0x9230),  # 22 Per frame functional group
+                gdcm.Tag(0x0028, 0x1050),  # 23 WindowCenter
+                gdcm.Tag(0x0028, 0x1051),  # 24 WindowWidth
+                gdcm.Tag(0x0028, 0x1052),  # 25 Rescale Intercept
+                gdcm.Tag(0x0028, 0x1053),  # 26 Rescale Slope
+                gdcm.Tag(0x0028, 0x1054),  # 27 Rescale Type
+                gdcm.Tag(0x0010, 0x0030), # 28 PatientBirthDate
+                gdcm.Tag(0x0010, 0x0040), # 29 PatientSex
+                gdcm.Tag(0x0008, 0x0020), # 30 Study Date
+                gdcm.Tag(0x0008, 0x1030), # 31 Study Description
+                gdcm.Tag(0x0008, 0x0021), # 32 Series Date
+                gdcm.Tag(0x0008, 0x103E), # 33 Series Description 
+                gdcm.Tag(0x0008, 0x0060), # 34 Modality
+                gdcm.Tag(0x0018, 0x0015), # 35 Body Part
+                gdcm.Tag(0x0020, 0x0013), # 36 Image Number/Instance Number 
+                gdcm.Tag(0x0020, 0x0012), # 37 Acquisition Number 
+                gdcm.Tag(0x0008, 0x0008), # 38 Image Type
+                gdcm.Tag(0x0018, 0x1050), # 39 Spatial Resolution
+                ]
         # Define the set of tags we are interested in, may need more
-        t1 = gdcm.Tag(0x10, 0x20);  # Patient ID
-        t2 = gdcm.Tag(0x10, 0x10);  # Patient Name
-        t3 = gdcm.Tag(0x20, 0x10);  # Study ID
-        t4 = gdcm.Tag(0x20, 0x0d);  # Study Instance UID
-        t5 = gdcm.Tag(0x20, 0x0e);  # Series Instance UID
-        t6 = gdcm.Tag(0x20, 0x11);  # Series Number
-        t7 = gdcm.Tag(0x28, 0x08);  # Number of Frames
-        t8 = gdcm.Tag(0x20, 0x32);  # Image Position
-        t10 = gdcm.Tag(0x28, 0x30);  # Pixel Spacing
-        t11 = gdcm.Tag(0x20, 0x37);  # Image Orientation Patient
-        t12 = gdcm.Tag(0x28, 0x02);  # Samples per pixel
-        t13 = gdcm.Tag(0x28, 0x04);  # Photometric Interpretation
-        t14 = gdcm.Tag(0x28, 0x10);  # Rows
-        t15 = gdcm.Tag(0x28, 0x11);  # Column
-        t16 = gdcm.Tag(0x28, 0x101);  # BitStored
-        t17 = gdcm.Tag(0x02, 0x02);  # Media Storage SOP Class UID
-        t18 = gdcm.Tag(0x02, 0x03);  # Media Storage SOP Instance UID
-        t19 = gdcm.Tag(0x02, 0x10);  # Transfer Syntax
-        t20 = gdcm.Tag(0x08, 0x16);  # SOP Class UID
-        t21 = gdcm.Tag(0x08, 0x18);  # SOP Instance UID
-        t22 = gdcm.Tag(0x5200, 0x9229);  # Shared functional group
-        t23 = gdcm.Tag(0x5200, 0x9230);  # Per frame functional group
-        t24 = gdcm.Tag(0x0028, 0x1050);  # WindowCenter
-        t25 = gdcm.Tag(0x0028, 0x1051);  # WindowWidth
-        t26 = gdcm.Tag(0x0028, 0x1052);  # Rescale Intercept
-        t27 = gdcm.Tag(0x0028, 0x1053);  # Rescale Slope
-        t28 = gdcm.Tag(0x0028, 0x1054);  # Rescale Type
-        t29 = gdcm.Tag(0x0010, 0x0030); # PatientBirthDate
-        t30 = gdcm.Tag(0x0010, 0x0040); # PatientSex
-        t31 = gdcm.Tag(0x0008, 0x0020); # Study Date
-        t32 = gdcm.Tag(0x0008, 0x1030); # Study Description
+
+        for t in tag:
+            s.AdddTag(t)
+
+        # Iterate from strPath
+        dirpath = os.walk(strPath)
+        for root, directories, files in dirpath:
+            for directory in directories:
+                      
+                d = gdcm.Directory();
+                nfiles = d.Load(os.path.join(root,directory));
+
+                if (nfiles == 0): 
+                    qDebug(os.path.join(root,directory)+" Empty directory")
+                else:    
+                    filenames = d.GetFilenames()
+                    qDebug(os.path.join(root,directory)+" The number of files to scan is "+ str(len(filenames)))
+
+                    b = s.Scan(filenames);
+
+                    # if no files in this directory
+                    dicomfiles = []
+                    if (not b):
+                        qDebug("No DICOM files in this directory")
+                    else:
+                        study_list = []
+                        series_list = []
+                        series_count = {}
+                        image_count = {}
+                        image_files = {}
+
+                        for aFile in filenames:
+                            if (s.IsKey(aFile)):  # DICOM file
+                                # qDebug("Scan "+aFile)
+                                is_multiframe = 0
+                                is_scout = 0  # if slice location or image position = NULL: is_scout = 1 and skipped
+
+                                pttv = gdcm.PythonTagToValue(s.GetMapping(aFile))
+                                pttv.Start()
+                                patient_DOB = ""
+                                patient_sex = ""
+                                study_description = ""
+
+                                # iterate until the end:
+                                while (not pttv.IsAtEnd()):
+
+                                    # get current value for tag and associated value:
+                                    # if tag was not found, then it was simply not added to the internal std::map
+                                    # Warning value can be None
+                                    tag = pttv.GetCurrentTag()
+                                    value = pttv.GetCurrentValue()
+
+                                    if (tag == t[0]):
+                                        #print ("PatientID->",value)
+                                        patient_id = value
+                                    elif (tag == t[1]):
+                                        #print ("PatientName->",value)
+                                        patient_name = value
+                                    elif (tag == t[28]):
+                                        # print ("PatientBirthDate->",value)
+                                        patient_DOB = value
+                                    elif (tag == t[29]):
+                                        patient_sex = value
+                                    elif (tag == t[3]):
+                                        # print ("StudyID->",value)
+                                        study_id = value
+                                    elif (tag == t[4]):
+                                        studyinstance_uid = value
+                                    elif (tag == t[30]):
+                                        # print ("StudyDate->",value)
+                                        study_date = value
+                                    elif (tag == t[31]):
+                                        study_description = value
+                                    elif (tag == t[6]):
+                                        series_num = value
+                                        # print ("SeriesNum->",value)
+                                    elif (tag == t[5]):
+                                        # print ("SeriesInstanceUID->",value)
+                                        seriesinstance_uid = value
+                                    elif (tag == t[7]):
+                                        # print ("NumberOfFrame->",value)
+                                        if (int(value) > 1):
+                                            is_multiframe = int(value)
+                                        else:
+                                            is_multiframe = 0
+                                    elif (tag == t[18]):
+                                        # print("Transfer Syntax->",value)
+                                        pass
+                                    elif (tag == t[19]):
+                                        # print("SOP Class UID->",value)
+                                        sopclass_uid = value
+                                        #sop_ClassName = sopclass_uid.GetName()
+                                    elif (tag == t[20]):
+                                        # print("SOP Instance UID->",value)
+                                        sopinstance_uid = value
+                                    # increment iterator
+                                    pttv.Next()
+
+                                # For each image
+                                # Find original db data
+                                # SELECT pathname, filename FROM image WHERE SOPInstanceUID == sopinstance_uid
+                                cur = self.con.cursor()
+                                cur.execute("SELECT pathname, filename FROM image WHERE SOPInstanceUID = '%s'" % sopinstance_uid)
+                                if (len(cur)==0):
+                                    pass
+                                elif (len(cur)>1):
+                                    qDebug("Weird")
+                                else:
+                                    # Copy Image File
+                                    for row in cur:
+                                        dstFile = row[0]+'\\'+row[1]
+                                    shutil.copyfile(aFile,dstFile)        
+
+                                # new StudyInstanceUID
+                                if (studyinstance_uid not in series_count.keys()):
+                                    # Add to the study_list
+                                    study_list.append([patient_id, patient_name, patient_DOB, patient_sex, study_id, studyinstance_uid, study_date, study_description, 0])
+                                    # Add count
+                                    series_count[studyinstance_uid] = 0
+
+                                # new SeriesInstanceUID
+                                if (seriesinstance_uid not in image_count.keys()):
+                                    # Add to the series_list
+                                    series_list.append([study_id, studyinstance_uid, series_num, seriesinstance_uid, sopclass_uid, sopinstance_uid, 0])
+                                    # Add count
+                                    image_count[seriesinstance_uid] = 0
+                                    image_files[seriesinstance_uid] = []
+                                    series_count[studyinstance_uid] += 1
+
+                                if (is_multiframe==0):
+                                    image_count[seriesinstance_uid] += 1
+                                    image_files[seriesinstance_uid].append([is_multiframe,aFile])
+                                else:
+                                    image_count[seriesinstance_uid] += is_multiframe
+                                    image_files[seriesinstance_uid].append([is_multiframe,aFile])   
+
+                        # For each Directory
+                        # Import to DB    
+
+                        # print(series_count)
+                        # print(image_count)
+
+                        # for each study_list items update series_count from series_count(studyinstance_uid)
+                        for study in study_list:
+                            study[8] = series_count[study[5]]
+
+                        # for each series_list items update images_count from image_count(seriesinstance_uid)
+                        for series in series_list:
+                            series[6] = image_count[series[3]]
+
+                        #print(study_list)
+                        #print(series_list)
+
+                        # for each series_instance_uid : analysis and fill attribute
 
 
-        s.AddTag(t1);
-        s.AddTag(t2);
-        s.AddTag(t3);
-        s.AddTag(t4);
-        s.AddTag(t5);
-        s.AddTag(t6);
-        s.AddTag(t7);
-        s.AddTag(t8);
-        s.AddTag(t10);
-        s.AddTag(t11);
-        s.AddTag(t12);
-        s.AddTag(t13);
-        s.AddTag(t14);
-        s.AddTag(t15);
-        s.AddTag(t16);
-        s.AddTag(t17);
-        s.AddTag(t18);
-        s.AddTag(t19);
-        s.AddTag(t20);
-        s.AddTag(t21);
-        s.AddTag(t22);
-        s.AddTag(t23);
-        s.AddTag(t29);
-        s.AddTag(t30);
-        s.AddTag(t31);
-        s.AddTag(t32);
-
-        b = s.Scan(filenames);
-
-        # if no files in this directory
-        dicomfiles = []
-        if (not b):
-            qDebug("No DICOM files in this directory")
-            return []
-
-        study_list = []
-        series_list = []
-        series_count = {}
-        image_count = {}
-        image_files = {}
-
-        for aFile in filenames:
-            if (s.IsKey(aFile)):  # DICOM file
-                # qDebug("Scan "+aFile)
-                is_multiframe = 0
-                is_scout = 0  # if slice location or image position = NULL: is_scout = 1 and skipped
-
-                pttv = gdcm.PythonTagToValue(s.GetMapping(aFile))
-                pttv.Start()
-                patient_DOB = ""
-                patient_sex = ""
-                study_description = ""
-
-                # iterate until the end:
-                while (not pttv.IsAtEnd()):
-
-                    # get current value for tag and associated value:
-                    # if tag was not found, then it was simply not added to the internal std::map
-                    # Warning value can be None
-                    tag = pttv.GetCurrentTag()
-                    value = pttv.GetCurrentValue()
-
-                    if (tag == t1):
-                        #print ("PatientID->",value)
-                        patient_id = value
-                    elif (tag == t2):
-                        #print ("PatientName->",value)
-                        patient_name = value
-                    elif (tag == t29):
-                        # print ("PatientBirthDate->",value)
-                        patient_DOB = value
-                    elif (tag == t30):
-                        patient_sex = value
-                    elif (tag == t3):
-                        # print ("StudyID->",value)
-                        study_id = value
-                    elif (tag == t4):
-                        studyinstance_uid = value
-                    elif (tag == t31):
-                        # print ("StudyDate->",value)
-                        study_date = value
-                    elif (tag == t32):
-                        study_description = value
-                    elif (tag == t6):
-                        series_num = value
-                        # print ("SeriesNum->",value)
-                    elif (tag == t5):
-                        # print ("SeriesInstanceUID->",value)
-                        seriesinstance_uid = value
-                    elif (tag == t7):
-                        # print ("NumberOfFrame->",value)
-                        if (int(value) > 1):
-                            is_multiframe = int(value)
-                        else:
-                            is_multiframe = 0
-                    elif (tag == t19):
-                        # print("Transfer Syntax->",value)
-                        pass
-                    elif (tag == t20):
-                        # print("SOP Class UID->",value)
-                        sopclass_uid = value
-                        #sop_ClassName = sopclass_uid.GetName()
-                    elif (tag == t21):
-                        # print("SOP Instance UID->",value)
-                        sopinstance_uid = value
-                    # increment iterator
-                    pttv.Next()
-
-                # new StudyInstanceUID
-                if (studyinstance_uid not in series_count.keys()):
-                    # Add to the study_list
-                    study_list.append([patient_id, patient_name, patient_DOB, patient_sex, study_id, studyinstance_uid, study_date, study_description, 0])
-                    # Add count
-                    series_count[studyinstance_uid] = 0
-
-                # new SeriesInstanceUID
-                if (seriesinstance_uid not in image_count.keys()):
-                    # Add to the series_list
-                    series_list.append([study_id, studyinstance_uid, series_num, seriesinstance_uid, sopclass_uid, sopinstance_uid, 0])
-                    # Add count
-                    image_count[seriesinstance_uid] = 0
-                    image_files[seriesinstance_uid] = []
-                    series_count[studyinstance_uid] += 1
-
-                if (is_multiframe==0):
-                    image_count[seriesinstance_uid] += 1
-                    image_files[seriesinstance_uid].append([is_multiframe,aFile])
-                else:
-                    image_count[seriesinstance_uid] += is_multiframe
-                    image_files[seriesinstance_uid].append([is_multiframe,aFile])   
-
-        # print(series_count)
-        # print(image_count)
-
-        # for each study_list items update series_count from series_count(studyinstance_uid)
-        for study in study_list:
-            study[8] = series_count[study[5]]
-
-        # for each series_list items update images_count from image_count(seriesinstance_uid)
-        for series in series_list:
-            series[6] = image_count[series[3]]
-
-        #print(study_list)
-        #print(series_list)
-
-        # for each series_instance_uid : analysis and fill attribute
-
-
-        return study_list, series_list, image_files
-
-
+                        return study_list, series_list, image_files
 
 
 if __name__ == "__main__":
@@ -745,31 +746,27 @@ if __name__ == "__main__":
     #Set up the application window
     app = QGuiApplication(sys.argv)
 
-    #Expose the list to the Qml code
-    m_Database = QSqlDatabase()
-    m_Database = QSqlDatabase.addDatabase("QSQLITE");
-    m_Database.setDatabaseName("d:\dev\Work\python\SQLTest\o3.db");
-
-    # Don't know why it is not working with (.mde file?, ...)
-    #    m_Database = QSqlDatabase.addDatabase("QODBC");
-    #    m_Database.setDatabaseName("DRIVER={Microsoft Access Driver (*.mdb)}; FIL={MS Access}; DBQ=C:\\OnDemand3DApp\\Users\\Common\\MasterDB\\lucion.mde;")
-
-    if (not m_Database.open()):
-        qDebug("ERROR")
-    else:
-        qDebug("DB Opened")
+    # SQL Server DB Connection
+    cnxn_str = ("Driver={SQL Server Native Client 11.0};"
+        "Server=localhost;"
+        "Database=OD3DSDB_In2Guide;"
+        "UID=SA;"
+        "PwD=Testing1122;")
+    try:
+        cnxn = pyodbc.connect(cnxn_str)
+    except pyodbc.Error as err:
+        qDebug("Couldn't connect to SQL Server")   
 
     my_StudyModel = myStudyModel()
     my_SeriesModel = studySeriesModel()
     my_StudyModel.selectRow.connect(my_SeriesModel.refreshUID)
     # my_SeriesModel.selectRow.connect()
 
-
     # Temporarily, setting default path manually
     #path = "c:\\dev\\TestData"
-    path = "D:\\In2Guide_back_up_data\\IMGDATA_Cdrive\\OD3DDATA\\IMGDATA"
+    path = "D:\\In2Guide_back_up_data" # \\IMGDATA_Cdrive\\OD3DDATA\\IMGDATA"
 
-    dirModel = myDirModel()
+    dirModel = myDirModel(cnxn)
     dirModel.setFilter(QDir.NoDotAndDotDot | QDir.AllDirs)
     dirModel.setRootPath(path)
 
@@ -787,5 +784,16 @@ if __name__ == "__main__":
 
     #Show the window
     if not engine.rootObjects():
+        cnxn.close()
         sys.exit(-1)
     sys.exit(app.exec_())
+
+
+
+
+
+
+
+                        
+        
+

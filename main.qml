@@ -52,7 +52,7 @@ ApplicationWindow {
 
         Connections {
             target: dirView
-            onDoubleClicked: {
+            function onDoubleClicked(index) {
                 console.log(sel.model.data(index))
                 sel.model.dirSelected(index)
             }
@@ -132,7 +132,7 @@ ApplicationWindow {
 
             Connections {
                 target: layout
-                onReProgress: {
+                function onReProgress(value) {
                     progressBar.value = value
                     if (value < 1.0) status.text = "Scanning"
                     if (value >= 1.0) {
